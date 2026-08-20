@@ -17,7 +17,7 @@
   no-op. A pristine backup is always kept so you can roll back.
 
 .PARAMETER InstallDir
-  Where the backup, patched DLL and state live. Default: %ProgramData%\termsrv-rdp-host
+  Where the backup, patched DLL and state live. Default: %ProgramData%\openrdp
 
 .PARAMETER Python
   Path to python.exe. Auto-discovered if omitted.
@@ -29,7 +29,7 @@
 #>
 [CmdletBinding()]
 param(
-  [string]$InstallDir = (Join-Path $env:ProgramData 'termsrv-rdp-host'),
+  [string]$InstallDir = (Join-Path $env:ProgramData 'openrdp'),
   [string]$Python
 )
 $ErrorActionPreference = 'Stop'
@@ -87,7 +87,7 @@ if ($patchedHash -eq $curHash) { Write-Host "already patched; nothing to do."; e
 # policy + firewall
 Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
 foreach ($p in @('TCP','UDP')) {
-  $n = "RDP-Host-$p"
+  $n = "OpenRDP-$p"
   if (-not (Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule -DisplayName $n -Direction Inbound -Action Allow -Protocol $p -LocalPort 3389 -Profile Any | Out-Null
   }

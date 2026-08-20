@@ -7,7 +7,7 @@
   Copies termsrv_autopatch.py + termsrv_guard.ps1 into InstallDir, creates the
   event-log source, seeds state with the CURRENT termsrv.dll hash (so the first
   run reads "healthy" if you have already run Enable-RdpHost.ps1), and registers
-  a Scheduled Task 'TermsrvRdpHostGuard' running as SYSTEM:
+  a Scheduled Task 'OpenRdpGuard' running as SYSTEM:
     * at system startup (catches an update that replaced termsrv.dll + rebooted)
     * every 6 hours (safety net)
     * on WindowsUpdateClient servicing success (EventID 19) - responsive re-patch
@@ -15,10 +15,10 @@
   Run elevated. Idempotent.
 #>
 [CmdletBinding()]
-param([string]$InstallDir = (Join-Path $env:ProgramData 'termsrv-rdp-host'))
+param([string]$InstallDir = (Join-Path $env:ProgramData 'openrdp'))
 $ErrorActionPreference='Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$TASK = 'TermsrvRdpHostGuard'
+$TASK = 'OpenRdpGuard'
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 foreach($f in @('termsrv_autopatch.py','termsrv_guard.ps1')){
@@ -26,9 +26,9 @@ foreach($f in @('termsrv_autopatch.py','termsrv_guard.ps1')){
 }
 $GUARD = Join-Path $InstallDir 'termsrv_guard.ps1'
 
-if(-not [System.Diagnostics.EventLog]::SourceExists('TermsrvRdpHost')){
-  New-EventLog -LogName Application -Source 'TermsrvRdpHost'
-  Write-Output "created event source TermsrvRdpHost"
+if(-not [System.Diagnostics.EventLog]::SourceExists('OpenRdp')){
+  New-EventLog -LogName Application -Source 'OpenRdp'
+  Write-Output "created event source OpenRdp"
 }
 
 $STATE = Join-Path $InstallDir 'guard.state.json'

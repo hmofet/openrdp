@@ -1,4 +1,4 @@
-# termsrv-rdp-host
+# openrdp
 
 Enable the Remote Desktop **host** role on Windows client SKUs (Home, and
 single-session Pro) by patching `termsrv.dll` - on **x64 and ARM64** - with a
@@ -84,16 +84,16 @@ role. Single remote session is what you get.
 ## Rollback
 
 `Enable-RdpHost.ps1` keeps a pristine copy at
-`%ProgramData%\termsrv-rdp-host\termsrv.dll.pristine.bak`. To revert:
+`%ProgramData%\openrdp\termsrv.dll.pristine.bak`. To revert:
 
 ```powershell
 Stop-Service UmRdpService,TermService -Force
 takeown /F C:\Windows\System32\termsrv.dll /A
 icacls  C:\Windows\System32\termsrv.dll /grant Administrators:F
-Copy-Item "$env:ProgramData\termsrv-rdp-host\termsrv.dll.pristine.bak" C:\Windows\System32\termsrv.dll -Force
+Copy-Item "$env:ProgramData\openrdp\termsrv.dll.pristine.bak" C:\Windows\System32\termsrv.dll -Force
 Start-Service TermService
 # remove the guard, if installed:
-Unregister-ScheduledTask -TaskName TermsrvRdpHostGuard -Confirm:$false
+Unregister-ScheduledTask -TaskName OpenRdpGuard -Confirm:$false
 ```
 
 A Windows cumulative update that ships a new `termsrv.dll` also reverts the
@@ -159,7 +159,7 @@ than guess.
 
 ## The guard (`termsrv_guard.ps1` + `Install-Guard.ps1`)
 
-A Scheduled Task (`TermsrvRdpHostGuard`, running as SYSTEM) that fires at
+A Scheduled Task (`OpenRdpGuard`, running as SYSTEM) that fires at
 startup, every 6 hours, and on a Windows-Update servicing event. Each run is one
 of three outcomes:
 
@@ -168,8 +168,8 @@ of three outcomes:
 - **drift** - the DLL changed (an update replaced it): back up, autopatch,
   deploy, verify 3389, record the new hash.
 - **refuse** - the autopatcher won't touch an unrecognized build: it logs an
-  **alert** to the Application event log (source `TermsrvRdpHost`) and to
-  `%ProgramData%\termsrv-rdp-host\guard.log`, with bounded retries so it never
+  **alert** to the Application event log (source `OpenRdp`) and to
+  `%ProgramData%\openrdp\guard.log`, with bounded retries so it never
   loops. RDP stays off, the machine stays healthy.
 
 ---

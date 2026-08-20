@@ -16,14 +16,14 @@
   autopatcher verifies every site before writing and refuses on ambiguity; the
   guard refuses to loop and always leaves a pristine backup.
 #>
-param([string]$InstallDir = (Join-Path $env:ProgramData 'termsrv-rdp-host'))
+param([string]$InstallDir = (Join-Path $env:ProgramData 'openrdp'))
 
 $ErrorActionPreference = 'Stop'
 $TARGET = "$env:WINDIR\System32\termsrv.dll"
 $AUTO   = Join-Path $InstallDir 'termsrv_autopatch.py'
 $LOG    = Join-Path $InstallDir 'guard.log'
 $STATE  = Join-Path $InstallDir 'guard.state.json'
-$EVSRC  = 'TermsrvRdpHost'
+$EVSRC  = 'OpenRdp'
 $MAXTRY = 3
 
 function Find-Python {
@@ -50,7 +50,7 @@ function Listening(){ [bool](Get-NetTCPConnection -LocalPort 3389 -State Listen 
 function EnsurePolicy(){
   Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -ErrorAction SilentlyContinue
   foreach($p in @('TCP','UDP')){
-    $n="RDP-Host-$p"
+    $n="OpenRDP-$p"
     if(-not (Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue)){
       New-NetFirewallRule -DisplayName $n -Direction Inbound -Action Allow -Protocol $p -LocalPort 3389 -Profile Any | Out-Null
     }
