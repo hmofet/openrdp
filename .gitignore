@@ -1,0 +1,14 @@
+# Never commit Microsoft binaries or symbols — this tool patches YOUR local copy.
+*.dll
+*.pdb
+*.bak
+*.new
+
+# Local state / logs produced at runtime
+guard.log
+guard.state.json
+*.state.json
+
+# Python
+__pycache__/
+*.pyc
