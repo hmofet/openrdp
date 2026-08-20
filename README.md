@@ -62,10 +62,10 @@ From an **elevated** PowerShell, in the repo folder:
 
 ```powershell
 # 1) enable RDP host now (backs up your DLL, patches, verifies 3389 binds)
-.\Enable-RdpHost.ps1
+.\Enable-OpenRdp.ps1
 
 # 2) (optional) keep it enabled across Windows Updates
-.\Install-Guard.ps1
+.\Install-OpenRdpGuard.ps1
 ```
 
 That's it. Connect with any RDP client to the machine's IP. If you use NLA, log
@@ -83,7 +83,7 @@ role. Single remote session is what you get.
 
 ## Rollback
 
-`Enable-RdpHost.ps1` keeps a pristine copy at
+`Enable-OpenRdp.ps1` keeps a pristine copy at
 `%ProgramData%\openrdp\termsrv.dll.pristine.bak`. To revert:
 
 ```powershell
@@ -101,14 +101,14 @@ patch on its own (that's what the guard re-applies).
 
 ---
 
-## The autopatcher (`termsrv_autopatch.py`)
+## The autopatcher (`openrdp_autopatch.py`)
 
 Standalone and side-effect-free - it reads a DLL and writes a patched copy;
 it never touches System32.
 
 ```
-python termsrv_autopatch.py locate <in.dll>            # find + print the sites
-python termsrv_autopatch.py patch  <in.dll> <out.dll>  # write a patched copy
+python openrdp_autopatch.py locate <in.dll>            # find + print the sites
+python openrdp_autopatch.py patch  <in.dll> <out.dll>  # write a patched copy
 # exit 0 = ok, 3 = refused (ambiguous / unrecognized / unsupported)
 ```
 
@@ -157,7 +157,7 @@ than guess.
 
 ---
 
-## The guard (`termsrv_guard.ps1` + `Install-Guard.ps1`)
+## The guard (`openrdp_guard.ps1` + `Install-OpenRdpGuard.ps1`)
 
 A Scheduled Task (`OpenRdpGuard`, running as SYSTEM) that fires at
 startup, every 6 hours, and on a Windows-Update servicing event. Each run is one

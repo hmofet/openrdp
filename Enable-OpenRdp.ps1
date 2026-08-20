@@ -8,7 +8,7 @@
   does, but by re-deriving the patch from your actual termsrv.dll each run
   (works on both x64 and ARM64, and survives a build the tool has never seen).
 
-  Steps: locate Python + termsrv_autopatch.py -> back up the live termsrv.dll ->
+  Steps: locate Python + openrdp_autopatch.py -> back up the live termsrv.dll ->
   produce a patched copy -> stop TermService -> swap it in (pending-rename +
   reboot if locked) -> set fDenyTSConnections=0 -> open the firewall -> start
   TermService -> verify port 3389 is LISTENING.
@@ -25,7 +25,7 @@
 .NOTES
   This modifies a Windows system file. Use only on machines you own/administer.
   A cumulative update that ships a new termsrv.dll reverts the patch - re-run
-  this, or install the guard (Install-Guard.ps1) to re-apply automatically.
+  this, or install the guard (Install-OpenRdpGuard.ps1) to re-apply automatically.
 #>
 [CmdletBinding()]
 param(
@@ -51,8 +51,8 @@ function Find-Python {
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $py    = Find-Python
-$auto  = Join-Path $scriptDir 'termsrv_autopatch.py'
-if (-not (Test-Path $auto)) { throw "termsrv_autopatch.py not found next to this script" }
+$auto  = Join-Path $scriptDir 'openrdp_autopatch.py'
+if (-not (Test-Path $auto)) { throw "openrdp_autopatch.py not found next to this script" }
 
 # ensure pefile (and capstone on x64) are importable
 & $py -c "import pefile" 2>$null

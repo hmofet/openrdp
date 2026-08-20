@@ -4,9 +4,9 @@
   Windows Update replaces termsrv.dll.
 
 .DESCRIPTION
-  Copies termsrv_autopatch.py + termsrv_guard.ps1 into InstallDir, creates the
+  Copies openrdp_autopatch.py + openrdp_guard.ps1 into InstallDir, creates the
   event-log source, seeds state with the CURRENT termsrv.dll hash (so the first
-  run reads "healthy" if you have already run Enable-RdpHost.ps1), and registers
+  run reads "healthy" if you have already run Enable-OpenRdp.ps1), and registers
   a Scheduled Task 'OpenRdpGuard' running as SYSTEM:
     * at system startup (catches an update that replaced termsrv.dll + rebooted)
     * every 6 hours (safety net)
@@ -21,10 +21,10 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $TASK = 'OpenRdpGuard'
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-foreach($f in @('termsrv_autopatch.py','termsrv_guard.ps1')){
+foreach($f in @('openrdp_autopatch.py','openrdp_guard.ps1')){
   Copy-Item (Join-Path $scriptDir $f) (Join-Path $InstallDir $f) -Force
 }
-$GUARD = Join-Path $InstallDir 'termsrv_guard.ps1'
+$GUARD = Join-Path $InstallDir 'openrdp_guard.ps1'
 
 if(-not [System.Diagnostics.EventLog]::SourceExists('OpenRdp')){
   New-EventLog -LogName Application -Source 'OpenRdp'

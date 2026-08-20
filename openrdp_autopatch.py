@@ -28,8 +28,8 @@ than guess if an anchor is ambiguous: a mis-patch of a system DLL is worse
 than an unbound port.
 
 Usage:
-  termsrv_autopatch.py locate <in.dll>
-  termsrv_autopatch.py patch  <in.dll> <out.dll>
+  openrdp_autopatch.py locate <in.dll>
+  openrdp_autopatch.py patch  <in.dll> <out.dll>
 Exit: 0 ok, 3 refused (ambiguous/unrecognized/unsupported).
 """
 from __future__ import annotations

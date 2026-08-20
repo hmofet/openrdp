@@ -1,7 +1,7 @@
 <#
-  termsrv_guard.ps1 - keep the RDP-host patch alive across Windows Updates.
+  openrdp_guard.ps1 - keep the RDP-host patch alive across Windows Updates.
 
-  Runs unattended (Scheduled Task; see Install-Guard.ps1). Each run:
+  Runs unattended (Scheduled Task; see Install-OpenRdpGuard.ps1). Each run:
     HEALTHY : System32\termsrv.dll hash == the hash we last patched to.
               Verify 3389 is LISTENING; if not, restart TermService once and
               re-check. Alert if it still will not bind. Never re-patches.
@@ -20,7 +20,7 @@ param([string]$InstallDir = (Join-Path $env:ProgramData 'openrdp'))
 
 $ErrorActionPreference = 'Stop'
 $TARGET = "$env:WINDIR\System32\termsrv.dll"
-$AUTO   = Join-Path $InstallDir 'termsrv_autopatch.py'
+$AUTO   = Join-Path $InstallDir 'openrdp_autopatch.py'
 $LOG    = Join-Path $InstallDir 'guard.log'
 $STATE  = Join-Path $InstallDir 'guard.state.json'
 $EVSRC  = 'OpenRdp'
