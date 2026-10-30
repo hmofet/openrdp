@@ -12,10 +12,19 @@
     * every 6 hours (safety net)
     * on WindowsUpdateClient servicing success (EventID 19) - responsive re-patch
 
+  -Patches must match what Enable-OpenRdp.ps1 applied ('host', 'multi' or
+  'host,multi'); the guard re-applies exactly that set after an update.
+
+  The guard runs as SYSTEM, which cannot find a per-user Python install, so
+  the python.exe found here (or passed with -Python) is recorded in the state
+  file for the guard to use.
+
   Run elevated. Idempotent.
 #>
 [CmdletBinding()]
-param([string]$InstallDir = (Join-Path $env:ProgramData 'openrdp'))
+param([string]$InstallDir = (Join-Path $env:ProgramData 'openrdp'),
+      [string]$Patches = 'host',
+      [string]$Python)
 $ErrorActionPreference='Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $TASK = 'OpenRdpGuard'
@@ -31,11 +40,30 @@ if(-not [System.Diagnostics.EventLog]::SourceExists('OpenRdp')){
   Write-Output "created event source OpenRdp"
 }
 
+if(-not $Python){
+  $Python = (Get-Command python -ErrorAction SilentlyContinue).Source
+  if(-not $Python){
+    $f = Get-ChildItem "$env:ProgramFiles\Python*\python.exe","$env:LOCALAPPDATA\Programs\Python\Python*\python.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if($f){ $Python = $f.FullName }
+  }
+}
+if(-not $Python -or -not (Test-Path $Python)){ throw "python.exe not found; pass -Python" }
+$Python = (Resolve-Path $Python).Path
+& $Python -c "import pefile" 2>$null
+if($LASTEXITCODE -ne 0){ throw "$Python cannot import pefile; run Enable-OpenRdp.ps1 first or pip install pefile" }
+Write-Output "guard will use $Python"
+
 $STATE = Join-Path $InstallDir 'guard.state.json'
 $cur = (Get-FileHash "$env:WINDIR\System32\termsrv.dll" -Algorithm SHA256).Hash
 if(-not (Test-Path $STATE)){
-  [pscustomobject]@{ last_patched=$cur; tries=[pscustomobject]@{} } | ConvertTo-Json -Depth 5 | Set-Content $STATE -Encoding ASCII
-  Write-Output "seeded state last_patched=$($cur.Substring(0,16))..."
+  [pscustomobject]@{ last_patched=$cur; patches=$Patches; python=$Python; tries=[pscustomobject]@{} } | ConvertTo-Json -Depth 5 | Set-Content $STATE -Encoding ASCII
+  Write-Output "seeded state last_patched=$($cur.Substring(0,16))... patches=$Patches"
+} else {
+  $s = Get-Content $STATE -Raw | ConvertFrom-Json
+  $s | Add-Member -NotePropertyName patches -NotePropertyValue $Patches -Force
+  $s | Add-Member -NotePropertyName python -NotePropertyValue $Python -Force
+  $s | ConvertTo-Json -Depth 5 | Set-Content $STATE -Encoding ASCII
+  Write-Output "state kept; patches=$Patches"
 }
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$GUARD`" -InstallDir `"$InstallDir`""

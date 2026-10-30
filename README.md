@@ -72,12 +72,35 @@ That's it. Connect with any RDP client to the machine's IP. If you use NLA, log
 in with a normal local account. To confirm it's listening:
 
 ```powershell
-Get-NetTCPConnection -LocalPort 3389 -State Listen
+Get-NetTCPConnection -LocalPort 3389 | Where-Object RemotePort -eq 0
 ```
 
-Enabling concurrent/multi-session (more than one simultaneous login) is a
-*separate* set of tweaks this tool does **not** do - it only enables the host
-role. Single remote session is what you get.
+### Concurrent sessions (`multi`, x64)
+
+By default the tool only enables the host role, and Windows still allows one
+session at a time: a second login (remote or at the console) disconnects the
+first. The optional `multi` patch set lifts that limit so several users can be
+logged in at once, for example someone at the console while someone else works
+over RDP.
+
+```powershell
+# Pro already hosts RDP: apply only the session-limit patch
+.\Enable-OpenRdp.ps1 -Patches multi
+.\Install-OpenRdpGuard.ps1 -Patches multi
+
+# Home: host role and concurrent sessions together
+.\Enable-OpenRdp.ps1 -Patches host,multi
+.\Install-OpenRdpGuard.ps1 -Patches host,multi
+```
+
+Give each concurrent session its own Windows account. `multi` does not lift
+the separate one-session-per-*user* rule (`fSingleSessionPerUser`), so the same
+account logging in twice still takes over its existing session.
+
+`multi` is x64 only for now; on ARM64 the tool refuses it. Tested live on
+Windows 11 Pro build 10.0.26100.8115: a second account logged in over RDP while
+the console session stayed active, and both sessions kept running. The patcher
+also locates the site in a second, different binary of that version.
 
 ---
 
@@ -109,7 +132,8 @@ it never touches System32.
 ```
 python openrdp_autopatch.py locate <in.dll>            # find + print the sites
 python openrdp_autopatch.py patch  <in.dll> <out.dll>  # write a patched copy
-# exit 0 = ok, 3 = refused (ambiguous / unrecognized / unsupported)
+# add --patches host,multi to choose patch sets (default: host)
+# exit 0 = ok, 3 = refused (ambiguous / unrecognized / unsupported / already patched)
 ```
 
 It auto-detects the architecture from the PE machine field and refuses cleanly
@@ -128,6 +152,16 @@ The patch sites are found from **stable structural anchors**, not offsets:
 3. **Patch B (bRemoteConnAllowed):** the Software-Licensing query returns the
    distinctive status `0xC004F012` on client SKUs; the value it yields is stored
    to a second global. That `store 0` is flipped to `store 1`.
+
+4. **Session limit (`multi`, x64):** `CDefPolicy::Query` loads two adjacent
+   fields of the licensing-policy object (the allowed maximum and the in-use
+   count), compares them, and on equality returns the deny status `0xD00A0013`.
+   The anchors are that status, the load/load/compare/branch shape just before
+   it, and the `lock xadd` elsewhere in the binary that identifies which field is
+   the in-use counter. The compare is replaced with "write 0x100 to the maximum,
+   then jump to the allow branch". `Logon` and `Reconnect` check the same
+   maximum, so they allow the extra sessions too. This is RDP Wrapper's
+   `DefPolicyPatch`, located structurally.
 
 Every located site is re-checked against its expected instruction encoding
 **before** a byte is written. If anything is ambiguous or doesn't match, the

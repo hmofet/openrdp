@@ -22,7 +22,9 @@ $ErrorActionPreference = 'Stop'
 $TARGET = "$env:WINDIR\System32\termsrv.dll"
 $AUTO   = Join-Path $InstallDir 'openrdp_autopatch.py'
 $LOG    = Join-Path $InstallDir 'guard.log'
-$STATE  = Join-Path $InstallDir 'guard.state.json'
+# not $STATE: PowerShell names are case-insensitive, so $STATE would be the same
+# variable as $state (the loaded object) and get overwritten by it
+$STATEFILE = Join-Path $InstallDir 'guard.state.json'
 $EVSRC  = 'OpenRdp'
 $MAXTRY = 3
 
@@ -44,9 +46,11 @@ function Log($lvl,$msg){
   }
 }
 function Hash($p){ if(Test-Path $p){(Get-FileHash $p -Algorithm SHA256).Hash}else{$null} }
-function LoadState(){ if(Test-Path $STATE){ Get-Content $STATE -Raw | ConvertFrom-Json }else{ [pscustomobject]@{last_patched=$null; tries=[pscustomobject]@{}} } }
-function SaveState($s){ $s | ConvertTo-Json -Depth 5 | Set-Content -Path $STATE -Encoding ASCII }
-function Listening(){ [bool](Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue) }
+function LoadState(){ if(Test-Path $STATEFILE){ Get-Content $STATEFILE -Raw | ConvertFrom-Json }else{ [pscustomobject]@{last_patched=$null; patches='host'; tries=[pscustomobject]@{}} } }
+function SaveState($s){ $s | ConvertTo-Json -Depth 5 | Set-Content -Path $STATEFILE -Encoding ASCII }
+# A listening socket has remote port 0. Some builds (26100) report the RDP
+# listener with state 0 instead of Listen, so -State Listen alone misses it.
+function Listening(){ [bool](Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue | Where-Object { $_.RemotePort -eq 0 }) }
 function EnsurePolicy(){
   Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -ErrorAction SilentlyContinue
   foreach($p in @('TCP','UDP')){
@@ -63,7 +67,20 @@ function SwapDll($src){
   takeown /F $TARGET /A | Out-Null
   icacls  $TARGET /grant "Administrators:F" | Out-Null
   try{ Copy-Item $src $TARGET -Force; return 'ok' }
+  catch{}
+  # TermService can restart and reload the DLL before the copy lands. A loaded
+  # DLL can still be renamed, so move it aside and put the patched copy in.
+  try{
+    $aside = "$TARGET.openrdp-old"
+    if(Test-Path $aside){ Remove-Item $aside -Force -ErrorAction SilentlyContinue }
+    if(Test-Path $aside){ $aside = "$TARGET.openrdp-old-$(Get-Date -Format yyyyMMddHHmmss)" }
+    Rename-Item $TARGET $aside
+    Copy-Item $src $TARGET
+    Restart-Service TermService -Force -ErrorAction SilentlyContinue
+    return 'ok'
+  }
   catch{
+    if(-not (Test-Path $TARGET) -and (Test-Path $aside)){ Rename-Item $aside $TARGET }
     Copy-Item $src "$TARGET.new" -Force
     $sig='[DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)]public static extern bool MoveFileEx(string a,string b,int f);'
     $k=Add-Type -MemberDefinition $sig -Name MFE -Namespace GuardWin -PassThru
@@ -73,9 +90,9 @@ function SwapDll($src){
 }
 
 try{
-  $py = Find-Python
-  if(-not $py){ Log 'ERROR' 'python not found'; exit 1 }
   $state = LoadState
+  $py = if($state.python -and (Test-Path $state.python)){ $state.python }else{ Find-Python }
+  if(-not $py){ Log 'ERROR' 'python not found (reinstall the guard with -Python)'; exit 1 }
   $cur = Hash $TARGET
   Log 'INFO' "run: termsrv.dll=$($cur.Substring(0,16))... last_patched=$($state.last_patched)"
 
@@ -98,7 +115,8 @@ try{
 
   $incoming = Join-Path $InstallDir 'termsrv_incoming.dll'; Copy-Item $TARGET $incoming -Force
   $cand = Join-Path $InstallDir 'termsrv_patched.dll'; if(Test-Path $cand){ Remove-Item $cand -Force }
-  $out = & $py $AUTO patch $incoming $cand 2>&1; $rc = $LASTEXITCODE
+  $patches = if($state.patches){ $state.patches }else{ 'host' }
+  $out = & $py $AUTO patch $incoming $cand --patches $patches 2>&1; $rc = $LASTEXITCODE
   $out | ForEach-Object { Log 'INFO' "autopatch: $_" }
   if($rc -ne 0 -or -not (Test-Path $cand)){
     Log 'ALERT' "autopatcher REFUSED (rc=$rc) on this build - NOT modifying System32. Investigate offsets."
@@ -120,4 +138,4 @@ try{
   else{ Log 'ALERT' "re-patched but 3389 not binding - autopatch matched but semantics differ; manual review" }
   exit 0
 }
-catch{ Log 'ERROR' "guard exception: $($_.Exception.Message)"; exit 1 }
+catch{ Log 'ERROR' "guard exception at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)"; exit 1 }

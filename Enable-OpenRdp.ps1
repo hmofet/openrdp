@@ -22,6 +22,12 @@
 .PARAMETER Python
   Path to python.exe. Auto-discovered if omitted.
 
+.PARAMETER Patches
+  Which patch sets to apply, comma-separated: 'host' (the RDP host role, the
+  default) and/or 'multi' (concurrent sessions, x64 only). Pro already hosts
+  RDP, so Pro wants just 'multi'; Home wants 'host,multi'. Install the guard
+  with the same value.
+
 .NOTES
   This modifies a Windows system file. Use only on machines you own/administer.
   A cumulative update that ships a new termsrv.dll reverts the patch - re-run
@@ -30,7 +36,8 @@
 [CmdletBinding()]
 param(
   [string]$InstallDir = (Join-Path $env:ProgramData 'openrdp'),
-  [string]$Python
+  [string]$Python,
+  [string]$Patches = 'host'
 )
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -77,7 +84,7 @@ $incoming = Join-Path $InstallDir 'termsrv_incoming.dll'
 Copy-Item $TARGET $incoming -Force
 $patched  = Join-Path $InstallDir 'termsrv_patched.dll'
 if (Test-Path $patched) { Remove-Item $patched -Force }
-& $py $auto patch $incoming $patched
+& $py $auto patch $incoming $patched --patches $Patches
 if ($LASTEXITCODE -ne 0) {
   throw "autopatcher refused (already patched, or an unrecognized build). Nothing changed."
 }
@@ -103,11 +110,23 @@ $reboot = $false
 try {
   Copy-Item $patched $TARGET -Force
 } catch {
-  Copy-Item $patched "$TARGET.new" -Force
-  $sig = '[DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)]public static extern bool MoveFileEx(string a,string b,int f);'
-  $k = Add-Type -MemberDefinition $sig -Name MFE -Namespace RdpHost -PassThru
-  if (-not $k::MoveFileEx("$TARGET.new", $TARGET, 5)) { throw "MoveFileEx failed" }  # REPLACE|DELAY_UNTIL_REBOOT
-  $reboot = $true
+  # TermService can restart and reload the DLL within seconds. A loaded DLL can
+  # still be renamed, so move it aside and put the patched copy in its place.
+  try {
+    $aside = "$TARGET.openrdp-old"
+    if (Test-Path $aside) { Remove-Item $aside -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $aside) { $aside = "$TARGET.openrdp-old-$(Get-Date -Format yyyyMMddHHmmss)" }
+    Rename-Item $TARGET $aside
+    Copy-Item $patched $TARGET
+    Restart-Service TermService -Force -ErrorAction SilentlyContinue
+  } catch {
+    if (-not (Test-Path $TARGET) -and (Test-Path $aside)) { Rename-Item $aside $TARGET }
+    Copy-Item $patched "$TARGET.new" -Force
+    $sig = '[DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)]public static extern bool MoveFileEx(string a,string b,int f);'
+    $k = Add-Type -MemberDefinition $sig -Name MFE -Namespace RdpHost -PassThru
+    if (-not $k::MoveFileEx("$TARGET.new", $TARGET, 5)) { throw "MoveFileEx failed" }  # REPLACE|DELAY_UNTIL_REBOOT
+    $reboot = $true
+  }
 }
 Set-Service TermService -StartupType Automatic
 if ($reboot) {
@@ -117,7 +136,8 @@ if ($reboot) {
 Start-Service TermService
 Start-Sleep -Seconds 4
 
-$listening = [bool](Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)
+# remote port 0 = listening socket (some builds report its state as 0, not Listen)
+$listening = [bool](Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue | Where-Object { $_.RemotePort -eq 0 })
 if ($listening) {
   Write-Host "`nSUCCESS: RDP host enabled. Port 3389 is LISTENING." -ForegroundColor Green
   Write-Host "termsrv.dll now: $($patchedHash.Substring(0,16))..."

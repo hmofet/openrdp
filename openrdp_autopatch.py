@@ -27,9 +27,19 @@ re-checked before any byte is written, and the tool REFUSES (exit 3) rather
 than guess if an anchor is ambiguous: a mis-patch of a system DLL is worse
 than an unbound port.
 
+Optional patch set "multi" (x64 only): concurrent sessions. CDefPolicy::Query
+compares the in-use session count with the allowed maximum (1 on client SKUs)
+and denies the connection when they are equal. The patch replaces that compare
+with "store 0x100 into the maximum, then take the allow branch" - RDP Wrapper's
+DefPolicyPatch semantics. Logon and Reconnect test the same field, so they pass
+too. Anchors: the 0xD00A0013 deny status, the load/load/cmp/jne shape on two
+adjacent fields of one object, and the lock xadd that marks which of the two is
+the in-use counter.
+
 Usage:
-  openrdp_autopatch.py locate <in.dll>
-  openrdp_autopatch.py patch  <in.dll> <out.dll>
+  openrdp_autopatch.py locate <in.dll> [--patches host,multi]
+  openrdp_autopatch.py patch  <in.dll> <out.dll> [--patches host,multi]
+  --patches defaults to "host" (the RDP-host role only).
 Exit: 0 ok, 3 refused (ambiguous/unrecognized/unsupported).
 """
 from __future__ import annotations
@@ -288,20 +298,115 @@ def find_x64(t: T):
         patches.append({"rva": imm_rva, "orig": b"\x00\x00\x00\x00", "new": b"\x01\x00\x00\x00", "desc": desc})
     return dict(arch="x64", func_rva=m["func"]-t.base, iss=m["iss"], rca=m["rca"], patches=patches)
 
+# =================== x64 multi-session (CDefPolicy::Query) ===================
+DENY_LICENSE = 0xD00A0013   # status CDefPolicy returns when the session limit is reached
+MAX_SESSIONS = 0x100        # same value RDP Wrapper writes
+
+def find_multi_x64(t: T):
+    try:
+        from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+        from capstone import x86 as X
+    except ImportError:
+        raise Refuse("x64 target needs capstone (pip install capstone)")
+    md = Cs(CS_ARCH_X86, CS_MODE_64); md.detail = True; md.skipdata = True
+    MEM, IMM, REG, RIP = X.X86_OP_MEM, X.X86_OP_IMM, X.X86_OP_REG, X.X86_REG_RIP
+    ins = []
+    for s in t.text_sections():
+        code = bytes(t.data[s.PointerToRawData: s.PointerToRawData + max(s.Misc_VirtualSize, s.SizeOfRawData)])
+        ins += [i for i in md.disasm(code, t.base + s.VirtualAddress) if i.id != 0]
+
+    def obj_load(i):   # mov r32, dword [base+disp], base not rip -> (dst, base, disp)
+        if i.mnemonic == "mov" and len(i.operands) == 2 and i.operands[0].type == REG \
+           and i.operands[0].size == 4 and i.operands[1].type == MEM and i.operands[1].mem.base not in (0, RIP) \
+           and i.operands[1].mem.index == 0:
+            return i.operands[0].reg, i.operands[1].mem.base, i.operands[1].mem.disp
+        return None
+
+    # disps that some `lock xadd [obj+disp]` touches = in-use counters
+    counters = {i.operands[0].mem.disp for i in ins
+                if i.mnemonic in ("lock xadd", "xadd") and i.prefix[0] == 0xF0 and i.operands[0].type == MEM}
+
+    hits = []
+    for k, i in enumerate(ins):
+        if not (i.mnemonic == "mov" and len(i.operands) == 2 and i.operands[0].type == REG
+                and i.operands[1].type == IMM and (i.operands[1].imm & 0xFFFFFFFF) == DENY_LICENSE):
+            continue
+        # walk back: ... load, load, cmp reg,reg, jne <past the deny>
+        for j in range(k - 1, max(k - 6, 3), -1):
+            jn, cm, l2, l1 = ins[j], ins[j-1], ins[j-2], ins[j-3]
+            if jn.mnemonic not in ("jne", "jnz") or jn.operands[0].type != IMM:
+                continue
+            if jn.operands[0].imm <= i.address:
+                continue                       # must skip over the deny
+            if cm.mnemonic != "cmp" or not all(o.type == REG for o in cm.operands):
+                break
+            a, b = obj_load(l1), obj_load(l2)
+            if not a or not b or a[1] != b[1] or abs(a[2] - b[2]) != 4:
+                break
+            if {o.reg for o in cm.operands} != {a[0], b[0]}:
+                break
+            cnt = [d for d in (a[2], b[2]) if d in counters]
+            if len(cnt) != 1:
+                break
+            mx = a[2] if cnt[0] == b[2] else b[2]
+            hits.append(dict(start=l1, jne=jn, base=a[1], max_disp=mx, cnt_disp=cnt[0], deny=i))
+            break
+    if len(hits) != 1:
+        raise Refuse(f"ambiguous/none: {len(hits)} CDefPolicy::Query session-limit matches")
+    h = hits[0]
+
+    # replacement: mov dword [base+max], 0x100 ; nop... ; jmp <allow target>
+    breg = h["base"]
+    names = {X.X86_REG_RAX:0, X.X86_REG_RCX:1, X.X86_REG_RDX:2, X.X86_REG_RBX:3, X.X86_REG_RSP:4,
+             X.X86_REG_RBP:5, X.X86_REG_RSI:6, X.X86_REG_RDI:7, X.X86_REG_R8:8, X.X86_REG_R9:9,
+             X.X86_REG_R10:10, X.X86_REG_R11:11, X.X86_REG_R12:12, X.X86_REG_R13:13, X.X86_REG_R14:14,
+             X.X86_REG_R15:15}
+    if breg not in names:
+        raise Refuse("CDefPolicy object base is not a general-purpose register")
+    n = names[breg]
+    mov = (b"\x41" if n >= 8 else b"") + bytes([0xC7, 0x80 | (n & 7)]) + (b"\x24" if n & 7 == 4 else b"") \
+          + struct.pack("<iI", h["max_disp"], MAX_SESSIONS)
+    start = h["start"].address; end = h["jne"].address + h["jne"].size; target = h["jne"].operands[0].imm
+    jlen = 2 if -128 <= target - end <= 127 else 5   # jmp lands where the jne ended
+    jat = end - jlen
+    jmp = bytes([0xEB, (target - end) & 0xFF]) if jlen == 2 else b"\xE9" + struct.pack("<i", target - end)
+    room = jat - start
+    if room < len(mov):
+        raise Refuse(f"session-limit site too short ({end-start} bytes) for the replacement")
+    new = mov + b"\x90" * (room - len(mov)) + jmp
+    rva = start - t.base
+    orig = bytes(t.data[t.roff(rva): t.roff(rva) + len(new)])
+    return dict(query_rva=start - t.base, max_disp=h["max_disp"], cnt_disp=h["cnt_disp"],
+                patches=[{"rva": rva, "orig": orig, "new": new,
+                          "desc": f"CDefPolicy::Query: max [obj+0x{h['max_disp']:x}] = 0x{MAX_SESSIONS:x}, always allow"}])
+
 # =================== driver ===================
-def analyze(t: T):
-    if t.machine == 0xAA64:
-        return find_arm64(t)
-    if t.machine == 0x8664:
-        return find_x64(t)
-    raise Refuse(f"unsupported machine 0x{t.machine:x} (need ARM64 0xAA64 or x64 0x8664)")
+PATCH_SETS = ("host", "multi")
+
+def analyze(t: T, want=("host",)):
+    if t.machine not in (0xAA64, 0x8664):
+        raise Refuse(f"unsupported machine 0x{t.machine:x} (need ARM64 0xAA64 or x64 0x8664)")
+    s = dict(arch="arm64" if t.machine == 0xAA64 else "x64", patches=[])
+    if "host" in want:
+        h = find_arm64(t) if t.machine == 0xAA64 else find_x64(t)
+        s.update(func_rva=h["func_rva"], iss=h["iss"], rca=h["rca"]); s["patches"] += h["patches"]
+    if "multi" in want:
+        if t.machine != 0x8664:
+            raise Refuse("multi-session patch is x64 only for now")
+        m = find_multi_x64(t)
+        s.update(query_rva=m["query_rva"], max_disp=m["max_disp"], cnt_disp=m["cnt_disp"]); s["patches"] += m["patches"]
+    return s
 
 def report(s):
-    print(f"arch={s['arch']}  CSLQuery::Initialize @ RVA 0x{s['func_rva']:x}")
-    print(f"  IsServerSku global        @ 0x{s['iss']:x}")
-    print(f"  bRemoteConnAllowed global @ 0x{s['rca']:x}")
+    print(f"arch={s['arch']}")
+    if "func_rva" in s:
+        print(f"  CSLQuery::Initialize      @ RVA 0x{s['func_rva']:x}")
+        print(f"  IsServerSku global        @ 0x{s['iss']:x}")
+        print(f"  bRemoteConnAllowed global @ 0x{s['rca']:x}")
+    if "query_rva" in s:
+        print(f"  CDefPolicy::Query check   @ RVA 0x{s['query_rva']:x}  (max +0x{s['max_disp']:x}, in-use +0x{s['cnt_disp']:x})")
     for i, p in enumerate(s["patches"]):
-        print(f"  PATCH {'AB'[i]} @ RVA 0x{p['rva']:x}  ({p['desc']})")
+        print(f"  PATCH {i+1} @ RVA 0x{p['rva']:x}  {p['orig'].hex()} -> {p['new'].hex()}  ({p['desc']})")
 
 def apply(t: T, s):
     for p in s["patches"]:
@@ -315,15 +420,23 @@ def apply(t: T, s):
             raise Refuse(f"post-write verify failed @0x{p['rva']:x}")
 
 def main():
-    if len(sys.argv) < 3:
+    args = sys.argv[1:]; want = ["host"]
+    if "--patches" in args:
+        i = args.index("--patches"); want = [w.strip() for w in args[i+1].split(",") if w.strip()]; del args[i:i+2]
+        bad = [w for w in want if w not in PATCH_SETS]
+        if bad or not want:
+            raise Refuse(f"--patches takes a comma list of {','.join(PATCH_SETS)}; got {bad or 'nothing'}")
+    if len(args) < 2:
         print(__doc__); return 2
-    cmd = sys.argv[1]; t = T(sys.argv[2]); s = analyze(t); report(s)
+    cmd = args[0]; t = T(args[1]); s = analyze(t, want); report(s)
     if cmd == "locate":
         print("OK (located, nothing written)"); return 0
     if cmd != "patch":
         raise Refuse(f"unknown command {cmd}")
+    if len(args) < 3:
+        raise Refuse("patch needs <in.dll> <out.dll>")
     apply(t, s)
-    out = sys.argv[3]; open(out, "wb").write(t.data)
+    out = args[2]; open(out, "wb").write(t.data)
     print(f"wrote {out}  sha256={hashlib.sha256(t.data).hexdigest().upper()}")
     return 0
 
