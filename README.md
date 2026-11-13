@@ -102,6 +102,40 @@ Windows 11 Pro build 10.0.26100.8115: a second account logged in over RDP while
 the console session stayed active, and both sessions kept running. The patcher
 also locates the site in a second, different binary of that version.
 
+### Same-user takeover when the console is signed in (`license`, ARM64)
+
+On a client SKU the Remote Desktop licence is **local-only**: it may be used by
+the session physically at the machine, not by a remote one. When someone is
+already signed in at the console, that single local-only licence is taken, and
+an incoming RDP connection for the **same** user is refused at licensing -
+*after* the listener has bound and NLA has already succeeded. The connection
+manager reports `0x80070005` (access denied) to the client and drops it
+(`RdpCoreTS` logs `SendLogonErrorInfoToClient` with that status, then a
+disconnect, before any session arbitration). On Pro this is where RDP would
+instead take over the console session and lock the screen; Home refuses.
+
+The `license` set restores the takeover behaviour. In
+`CEnforcementCore::GetInstanceOfTSLicense`, right after the call to
+`CSLQuery::IsLicenseTypeLocalOnly`, a two-branch guard proceeds to fetch the
+licence if the query failed **or** the returned local-only flag is 0, and
+otherwise returns `0x80070005`. The patch turns the second branch (`cbz w8, ok`)
+into an unconditional `b ok`, so the licence is always fetched - RDP Wrapper's
+`LocalOnlyPatch` semantics, applied at the single consumer of the flag. When the
+flag is already 0 (nobody holds the local licence) the branch was taken anyway,
+so the no-one-signed-in and remote-only cases are byte-for-byte unchanged; only
+the previously-denied occupied-console case now proceeds.
+
+```powershell
+# Home on ARM64: host role, and same-user takeover of a busy console
+.\Enable-OpenRdp.ps1 -Patches host,license
+.\Install-OpenRdpGuard.ps1 -Patches host,license
+```
+
+`license` is **ARM64 only**. x64 Pro already hosts RDP and is not local-only
+licensed, so the gate is not present there in a locatable form; the tool refuses
+`license` on x64 (use `multi` for x64 concurrency). The set is a single changed
+instruction and leaves the `host` patches byte-identical.
+
 ---
 
 ## Rollback
@@ -132,7 +166,7 @@ it never touches System32.
 ```
 python openrdp_autopatch.py locate <in.dll>            # find + print the sites
 python openrdp_autopatch.py patch  <in.dll> <out.dll>  # write a patched copy
-# add --patches host,multi to choose patch sets (default: host)
+# add --patches host,license,multi to choose patch sets (default: host)
 # exit 0 = ok, 3 = refused (ambiguous / unrecognized / unsupported / already patched)
 ```
 
@@ -162,6 +196,16 @@ The patch sites are found from **stable structural anchors**, not offsets:
    then jump to the allow branch". `Logon` and `Reconnect` check the same
    maximum, so they allow the extra sessions too. This is RDP Wrapper's
    `DefPolicyPatch`, located structurally.
+
+5. **Local-only licence (`license`, ARM64):** in
+   `CEnforcementCore::GetInstanceOfTSLicense`, the call to
+   `CSLQuery::IsLicenseTypeLocalOnly` writes a flag through an `int*` out-param;
+   a guard then denies with `0x80070005` when the licence is local-only. The
+   anchors are the call-site shape (an `add x1, sp, #k` out-param, the `bl`, then
+   `tbnz w0,#31,L` / `ldr w8,[sp,#k]` / `cbz w8,L` sharing the stack slot and the
+   branch target), the callee writing 0 to its out-param near entry, and the
+   deny block loading the `0x80070005` magic. The `cbz` is turned into an
+   unconditional branch to the proceed target. ARM64 only (see above).
 
 Every located site is re-checked against its expected instruction encoding
 **before** a byte is written. If anything is ambiguous or doesn't match, the
@@ -205,6 +249,15 @@ of three outcomes:
   **alert** to the Application event log (source `OpenRdp`) and to
   `%ProgramData%\openrdp\guard.log`, with bounded retries so it never
   loops. RDP stays off, the machine stays healthy.
+
+Both the guard and `Enable-OpenRdp.ps1` install the patched DLL by **renaming
+the old file aside and copying the new one in as a fresh file**, never by
+overwriting `termsrv.dll` in place. Windows caches an *image section* per file,
+and a restarting service re-maps that cached section, so an in-place overwrite
+can leave the previous code executing until the next reboot - which on ARM64
+showed up as the host patches being live while a newly added patch silently had
+no effect. A new file object gets a new section, so the swap takes effect on the
+next service start.
 
 ---
 

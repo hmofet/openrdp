@@ -107,26 +107,24 @@ Start-Sleep -Seconds 2
 takeown /F $TARGET /A | Out-Null
 icacls  $TARGET /grant "Administrators:F" | Out-Null
 $reboot = $false
+# Replace the FILE OBJECT (rename aside + copy fresh) - never overwrite in place.
+# Windows caches an image section per file, and a restarted service re-maps the
+# cached section, so an in-place overwrite can keep the OLD code live until a
+# reboot. A loaded DLL can still be renamed, and a new file gets a new section.
+$aside = "$TARGET.openrdp-old"
+if (Test-Path $aside) { Remove-Item $aside -Force -ErrorAction SilentlyContinue }
+if (Test-Path $aside) { $aside = "$TARGET.openrdp-old-$(Get-Date -Format yyyyMMddHHmmss)" }
 try {
+  Rename-Item $TARGET $aside -ErrorAction Stop
   Copy-Item $patched $TARGET -Force
 } catch {
-  # TermService can restart and reload the DLL within seconds. A loaded DLL can
-  # still be renamed, so move it aside and put the patched copy in its place.
-  try {
-    $aside = "$TARGET.openrdp-old"
-    if (Test-Path $aside) { Remove-Item $aside -Force -ErrorAction SilentlyContinue }
-    if (Test-Path $aside) { $aside = "$TARGET.openrdp-old-$(Get-Date -Format yyyyMMddHHmmss)" }
-    Rename-Item $TARGET $aside
-    Copy-Item $patched $TARGET
-    Restart-Service TermService -Force -ErrorAction SilentlyContinue
-  } catch {
-    if (-not (Test-Path $TARGET) -and (Test-Path $aside)) { Rename-Item $aside $TARGET }
-    Copy-Item $patched "$TARGET.new" -Force
-    $sig = '[DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)]public static extern bool MoveFileEx(string a,string b,int f);'
-    $k = Add-Type -MemberDefinition $sig -Name MFE -Namespace RdpHost -PassThru
-    if (-not $k::MoveFileEx("$TARGET.new", $TARGET, 5)) { throw "MoveFileEx failed" }  # REPLACE|DELAY_UNTIL_REBOOT
-    $reboot = $true
-  }
+  # rename failed (DLL still locked): stage a pending-rename, apply on reboot
+  if (-not (Test-Path $TARGET) -and (Test-Path $aside)) { Rename-Item $aside $TARGET }
+  Copy-Item $patched "$TARGET.new" -Force
+  $sig = '[DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)]public static extern bool MoveFileEx(string a,string b,int f);'
+  $k = Add-Type -MemberDefinition $sig -Name MFE -Namespace RdpHost -PassThru
+  if (-not $k::MoveFileEx("$TARGET.new", $TARGET, 5)) { throw "MoveFileEx failed" }  # REPLACE|DELAY_UNTIL_REBOOT
+  $reboot = $true
 }
 Set-Service TermService -StartupType Automatic
 if ($reboot) {

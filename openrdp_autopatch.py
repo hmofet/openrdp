@@ -27,6 +27,24 @@ re-checked before any byte is written, and the tool REFUSES (exit 3) rather
 than guess if an anchor is ambiguous: a mis-patch of a system DLL is worse
 than an unbound port.
 
+Optional patch set "license" (ARM64 only): same-user takeover when the console
+is occupied. On a client SKU the Remote Desktop licence is local-only, and
+CEnforcementCore::GetInstanceOfTSLicense denies a remote connection with
+0x80070005 (E_ACCESSDENIED) while that single local-only licence is held by the
+signed-in console session - the listener binds, NLA passes, then licensing
+refuses (RdpCoreTS SendLogonErrorInfoToClient 0x80070005, disconnect 4417,
+before any session arbitration). The gate is a two-branch guard right after the
+call to CSLQuery::IsLicenseTypeLocalOnly: if the HRESULT failed OR the out-param
+local-only flag is 0, it proceeds to fetch the licence; otherwise it loads
+0x80070005 and returns it. The patch turns the second guard (cbz w8,ok) into an
+unconditional branch (b ok), so it always fetches the licence - RDP Wrapper's
+LocalOnlyPatch semantics, here applied at the single consumer. Anchors: the
+call-site shape (add x1,sp,#k out-param / bl / tbnz w0,#31,L / ldr w8,[sp,#k]
+with the SAME slot / cbz w8,L with the SAME target L), the callee writing 0 to
+its int* out-param near entry, and the deny block loading the 0x80070005 magic.
+x64 Pro hosts RDP already and is not local-only licensed; the gate is not
+present there in a locatable form, so this set refuses on x64 (use "multi").
+
 Optional patch set "multi" (x64 only): concurrent sessions. CDefPolicy::Query
 compares the in-use session count with the allowed maximum (1 on client SKUs)
 and denies the connection when they are equal. The patch replaces that compare
@@ -37,8 +55,8 @@ adjacent fields of one object, and the lock xadd that marks which of the two is
 the in-use counter.
 
 Usage:
-  openrdp_autopatch.py locate <in.dll> [--patches host,multi]
-  openrdp_autopatch.py patch  <in.dll> <out.dll> [--patches host,multi]
+  openrdp_autopatch.py locate <in.dll> [--patches host,license,multi]
+  openrdp_autopatch.py patch  <in.dll> <out.dll> [--patches host,license,multi]
   --patches defaults to "host" (the RDP-host role only).
 Exit: 0 ok, 3 refused (ambiguous/unrecognized/unsupported).
 """
@@ -380,8 +398,96 @@ def find_multi_x64(t: T):
                 patches=[{"rva": rva, "orig": orig, "new": new,
                           "desc": f"CDefPolicy::Query: max [obj+0x{h['max_disp']:x}] = 0x{MAX_SESSIONS:x}, always allow"}])
 
+# =================== ARM64 local-only licence gate (CEnforcementCore::GetInstanceOfTSLicense) ===================
+LOCALONLY_DENY = 0x80070005   # E_ACCESSDENIED the gate returns when the licence is local-only
+
+def _license_callee_ok(t: T, fva):
+    """Verify fva looks like CSLQuery::IsLicenseTypeLocalOnly: a pacibsp-framed
+    function that copies its int* out-param (x1) and writes 0 through it early."""
+    try:
+        o = t.roff(fva - t.base)
+    except Refuse:
+        return False
+    if u32(t.data, o) != 0xD503237F:            # pacibsp
+        return False
+    movreg = None
+    for i in range(28):
+        w = u32(t.data, o + i*4)
+        if (w & 0xFFFFFFE0) == 0xAA0103E0:       # mov xR, x1  (orr xR, xzr, x1)
+            movreg = w & 0x1F
+        if (w & 0xFFC00000) == 0xB9000000 and (w & 0x1F) == 31:   # str wzr, [xR, #imm]
+            r = (w >> 5) & 0x1F
+            if r == movreg or r == 1:
+                return True
+    return False
+
+def find_license_arm64(t: T):
+    nlo, nhi = _arm64_native_range(t)
+    def sx(v, b): return v - (1 << b) if v & (1 << (b-1)) else v
+    hits = []
+    for s in t.text_sections():
+        so = s.PointerToRawData; srva = s.VirtualAddress
+        n = max(s.Misc_VirtualSize, s.SizeOfRawData) & ~3
+        for i in range(4*6, n, 4):
+            va = t.base + srva + i
+            if not (nlo <= va < nhi):
+                continue
+            w = u32(t.data, so + i)
+            if (w & 0xFF000000) != 0x34000000:              # cbz wRt, L (32-bit)
+                continue
+            rt_c = w & 0x1F
+            L = va + sx((w >> 5) & 0x7FFFF, 19) * 4
+            wl = u32(t.data, so + i - 4)                    # ldr wRt, [sp, #k]
+            if (wl & 0xFFC00000) != 0xB9400000 or ((wl >> 5) & 0x1F) != 31 or (wl & 0x1F) != rt_c:
+                continue
+            k = ((wl >> 10) & 0xFFF) * 4
+            wt = u32(t.data, so + i - 8)                    # tbnz w?, #bit, L  (same L)
+            if (wt & 0x7F000000) != 0x37000000:
+                continue
+            if (va - 8) + sx((wt >> 5) & 0x3FFF, 14) * 4 != L:
+                continue
+            bltgt = blpos = None                            # bl F within 3..5 insns back
+            for j in (3, 4, 5):
+                wb = u32(t.data, so + i - 4*j)
+                if (wb >> 26) == 0x25:
+                    bltgt = (va - 4*j) + sx(wb & 0x03FFFFFF, 26) * 4; blpos = j; break
+            if bltgt is None:
+                continue
+            okadd = False                                   # add x1, sp, #k before the bl (same slot)
+            for j in range(blpos + 1, blpos + 6):
+                wa = u32(t.data, so + i - 4*j)
+                if (wa & 0xFFC003FF) == (0x91000000 | (31 << 5) | 1) and ((wa >> 10) & 0xFFF) == k:
+                    okadd = True; break
+            if not okadd:
+                continue
+            denyok = False                                  # deny block (cbz..L) loads the magic
+            p = i + 4
+            while t.base + srva + p < L and p < n:
+                wd = u32(t.data, so + p)
+                if (wd & 0xFF000000) == 0x18000000:         # ldr w?, <literal>
+                    litva = (t.base + srva + p) + sx((wd >> 5) & 0x7FFFF, 19) * 4
+                    try:
+                        if u32(t.data, t.roff(litva - t.base)) == LOCALONLY_DENY:
+                            denyok = True; break
+                    except Refuse:
+                        pass
+                p += 4
+            if not denyok:
+                continue
+            if not _license_callee_ok(t, bltgt):
+                continue
+            hits.append(dict(va=va, L=L, w=w, callee=bltgt))
+    if len(hits) != 1:
+        raise Refuse(f"ambiguous/none: {len(hits)} ARM64 local-only licence-gate matches")
+    h = hits[0]
+    newb = 0x14000000 | (((h["L"] - h["va"]) // 4) & 0x03FFFFFF)   # b L
+    return dict(gate_rva=h["va"] - t.base, callee_rva=h["callee"] - t.base,
+                patches=[{"rva": h["va"] - t.base, "orig": struct.pack("<I", h["w"]),
+                          "new": struct.pack("<I", newb),
+                          "desc": "GetInstanceOfTSLicense local-only: cbz w8,ok -> b ok (bypass local-only deny)"}])
+
 # =================== driver ===================
-PATCH_SETS = ("host", "multi")
+PATCH_SETS = ("host", "license", "multi")
 
 def analyze(t: T, want=("host",)):
     if t.machine not in (0xAA64, 0x8664):
@@ -390,6 +496,12 @@ def analyze(t: T, want=("host",)):
     if "host" in want:
         h = find_arm64(t) if t.machine == 0xAA64 else find_x64(t)
         s.update(func_rva=h["func_rva"], iss=h["iss"], rca=h["rca"]); s["patches"] += h["patches"]
+    if "license" in want:
+        if t.machine != 0xAA64:
+            raise Refuse("license (local-only) patch is ARM64 only; x64 client SKUs host RDP already "
+                         "and use 'multi' for concurrency")
+        g = find_license_arm64(t)
+        s.update(gate_rva=g["gate_rva"], callee_rva=g["callee_rva"]); s["patches"] += g["patches"]
     if "multi" in want:
         if t.machine != 0x8664:
             raise Refuse("multi-session patch is x64 only for now")
@@ -403,6 +515,9 @@ def report(s):
         print(f"  CSLQuery::Initialize      @ RVA 0x{s['func_rva']:x}")
         print(f"  IsServerSku global        @ 0x{s['iss']:x}")
         print(f"  bRemoteConnAllowed global @ 0x{s['rca']:x}")
+    if "gate_rva" in s:
+        print(f"  GetInstanceOfTSLicense    @ RVA 0x{s['gate_rva']:x}  (local-only deny -> always fetch licence)")
+        print(f"  IsLicenseTypeLocalOnly    @ RVA 0x{s['callee_rva']:x}")
     if "query_rva" in s:
         print(f"  CDefPolicy::Query check   @ RVA 0x{s['query_rva']:x}  (max +0x{s['max_disp']:x}, in-use +0x{s['cnt_disp']:x})")
     for i, p in enumerate(s["patches"]):
